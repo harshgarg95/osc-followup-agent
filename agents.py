@@ -8,10 +8,12 @@ drafter, reviewer) handle the downstream pipeline.
 
 import json
 import re
+import time
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
 
+import config
 from config import GROQ_MODEL
 from state import LeadState
 
@@ -24,9 +26,104 @@ OSC_CONTEXT = (
 )
 
 
-def _llm(temperature: float = 0.3) -> ChatGroq:
+def _llm(temperature: float = 0.3, model: str = None) -> ChatGroq:
     """Build a ChatGroq client. The API key is read from the GROQ_API_KEY env var."""
-    return ChatGroq(model=GROQ_MODEL, temperature=temperature)
+    return ChatGroq(model=model or config.GROQ_MODEL, temperature=temperature)
+
+
+# --------------------------------------------------------------------------- #
+# Model resilience + rate-limit pacing
+# --------------------------------------------------------------------------- #
+_last_call_at = 0.0
+
+
+def _models() -> list:
+    """Primary, then fallback, then any other model Groq currently serves."""
+    models = [config.GROQ_MODEL]
+    if config.GROQ_FALLBACK_MODEL and config.GROQ_FALLBACK_MODEL not in models:
+        models.append(config.GROQ_FALLBACK_MODEL)
+    try:
+        for extra in config.available_chat_models():
+            if extra not in models:
+                models.append(extra)
+    except Exception:
+        pass
+    return models
+
+
+def _is_rate_limit(exc: Exception) -> bool:
+    return "rate_limit" in str(exc).lower() or type(exc).__name__ == "RateLimitError"
+
+
+def _is_model_unavailable(exc: Exception) -> bool:
+    """True for a retired/inaccessible model (Groq returns HTTP 404)."""
+    if type(exc).__name__ in ("NotFoundError", "BadRequestError"):
+        return True
+    text = str(exc).lower()
+    return any(m in text for m in (
+        "model_not_found", "does not exist", "decommissioned",
+        "has been deprecated", "error code: 404", "model_decommissioned",
+    ))
+
+
+def _is_api_error(exc: Exception) -> bool:
+    """Generic transport/server-side failure worth retrying on another model."""
+    if type(exc).__name__ in (
+        "APIError", "APIStatusError", "APIConnectionError", "APITimeoutError",
+        "InternalServerError", "ServiceUnavailableError",
+    ):
+        return True
+    text = str(exc).lower()
+    return any(m in text for m in ("error code: 5", "timeout", "connection error"))
+
+
+def _retry_after(exc: Exception) -> float:
+    """Seconds Groq asks us to wait, parsed from the 429 body; default 20s."""
+    m = re.search(r"try again in ([\d.]+)\s*(ms|s)\b", str(exc), re.I)
+    if m:
+        val = float(m.group(1))
+        return val / 1000.0 if m.group(2).lower() == "ms" else val
+    return 20.0
+
+
+def _pace() -> None:
+    """Space calls out so a batch does not slam the free-tier TPM ceiling."""
+    global _last_call_at
+    gap = config.MIN_SECONDS_BETWEEN_CALLS - (time.time() - _last_call_at)
+    if gap > 0:
+        time.sleep(gap)
+    _last_call_at = time.time()
+
+
+def _invoke(messages, temperature: float = 0.3):
+    """Invoke Groq with pacing, rate-limit backoff and multi-model failover.
+
+    Previously each node called ``_invoke(...)`` directly, so a retired
+    model (404) or a free-tier rate limit (429) killed the whole graph mid-run.
+    """
+    attempts = []
+    for model in _models():
+        for attempt in range(config.MAX_RATE_LIMIT_RETRIES):
+            try:
+                _pace()
+                return _llm(temperature=temperature, model=model).invoke(messages)
+            except Exception as exc:
+                if _is_rate_limit(exc):
+                    wait = min(_retry_after(exc) + 1.0, 60.0)
+                    if attempt < config.MAX_RATE_LIMIT_RETRIES - 1:
+                        time.sleep(wait)
+                        continue
+                    attempts.append(f"{model}: rate-limited after "
+                                    f"{config.MAX_RATE_LIMIT_RETRIES} attempts")
+                    break
+                if _is_model_unavailable(exc) or _is_api_error(exc):
+                    attempts.append(f"{model}: {type(exc).__name__} {str(exc)[:90]}")
+                    break
+                raise
+    raise RuntimeError(
+        "Every Groq model candidate failed. Tried:\n  - "
+        + "\n  - ".join(attempts or ["(no models resolved)"])
+    )
 
 
 def _log(state: LeadState, agent: str, action: str, output: str) -> None:
@@ -99,7 +196,7 @@ def supervisor_node(state: LeadState) -> LeadState:
         )
     )
     human = HumanMessage(content=_lead_block(lead))
-    response = _llm().invoke([system, human])
+    response = _invoke([system, human])
     classification, reason = _parse_classification(response.content)
 
     state["classification"] = classification
@@ -140,7 +237,7 @@ def qualifier_node(state: LeadState) -> LeadState:
             f"Supervisor reason: {state.get('classification_reason', '')}"
         )
     )
-    response = _llm().invoke([system, human])
+    response = _invoke([system, human])
     qualification = response.content.strip()
 
     state["qualification"] = qualification
@@ -184,7 +281,7 @@ def drafter_node(state: LeadState) -> LeadState:
         )
     )
     human = HumanMessage(content=f"{_lead_block(lead)}\n\n{context}")
-    response = _llm().invoke([system, human])
+    response = _invoke([system, human])
     draft = response.content.strip()
 
     state["draft_message"] = draft
@@ -229,7 +326,7 @@ def reviewer_node(state: LeadState) -> LeadState:
             f"Draft message:\n{state.get('draft_message', '')}"
         )
     )
-    response = _llm().invoke([system, human])
+    response = _invoke([system, human])
     passed, feedback = _parse_review(response.content)
 
     state["review_result"] = feedback

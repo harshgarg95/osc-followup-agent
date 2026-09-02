@@ -16,3 +16,6 @@ env/
 .DS_Store
 .idea/
 .vscode/
+
+# Test output
+routing6_results.json
